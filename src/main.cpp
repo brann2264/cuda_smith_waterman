@@ -54,12 +54,14 @@ std::vector<SequencePair> parseInputFile(const std::string& filename) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <input_file.txt>" << std::endl;
+    // Require 3 arguments: program name, input file, output file
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <input_file.txt> <output_file.txt>" << std::endl;
         return 1;
     }
 
     std::string filename = argv[1];
+    std::string out_filename = argv[2]; // Use the new argument
     std::vector<SequencePair> dataset = parseInputFile(filename);
 
     if (dataset.empty()) {
@@ -67,8 +69,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Set up output file
-    std::string out_filename = "outputs/sw_cuda.txt";
+    // Set up output file using the provided argument
     std::ofstream outfile(out_filename);
     
     if (!outfile.is_open()) {
@@ -89,8 +90,8 @@ int main(int argc, char* argv[]) {
         run_cuda_smith_waterman(dataset[i].q, dataset[i].d, score, start, stop, aligned_q, aligned_d, gpu_time_ms);
         
         // Write to file instead of console
-        outfile << "Q:\t" << dataset[i].q << "\n";
-        outfile << "D:\t" << dataset[i].d << "\n";
+        // outfile << "Q:\t" << dataset[i].q << "\n";
+        // outfile << "D:\t" << dataset[i].d << "\n";
         outfile << "Match " << i + 1 << " [Score: " << score << ", Start: " << start << ", Stop: " << stop << "]\n";
         outfile << "\tD: " << aligned_d << "\n";
         outfile << "\tQ: " << aligned_q << "\n";
