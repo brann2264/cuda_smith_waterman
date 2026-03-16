@@ -86,7 +86,7 @@ int main(int argc, char* argv[]) {
         std::string aligned_q, aligned_d;
         
         // Execute GPU calculation
-        run_cuda_smith_waterman(dataset[i].q, dataset[i].d, score, start, stop, aligned_q, aligned_d, gpu_time_ms);
+        run_cuda_smith_waterman_batched(dataset[i].q, dataset[i].d, score, start, stop, aligned_q, aligned_d, gpu_time_ms);
         
         // Write to file instead of console
         outfile << "Q:\t" << dataset[i].q << "\n";
