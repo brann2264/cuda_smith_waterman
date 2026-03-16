@@ -1,112 +1,281 @@
 #include <cuda_runtime.h>
-#include <iostream>
-#include <algorithm>
-#include <string>
-#include <vector>
-#include <cstring>
-#include <cstdlib>
 
-// Define our Tile dimensions. 32 perfectly matches one CUDA Warp.
-#define TILE_SIZE 32
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#define CUDA_CHECK(call)                                                         \
+    do {                                                                         \
+        cudaError_t err__ = (call);                                              \
+        if (err__ != cudaSuccess) {                                              \
+            std::cerr << "CUDA error: " << cudaGetErrorString(err__)             \
+                      << " at " << __FILE__ << ":" << __LINE__ << "\n";          \
+            std::exit(1);                                                        \
+        }                                                                        \
+    } while (0)
+
+// ============================================================
+// Config / helper structs
+// ============================================================
+
+struct SWBatchConfig {
+    int window_len = 0;        // 0 => auto
+    int stride = 0;            // 0 => auto
+    int top_k = 8;             // refine top-K windows
+    int batch_windows = 1024;  // windows per GPU launch batch
+    int threads_per_block = 256;
+    int refine_extra = 0;      // extra halo beyond overlap
+};
+
+struct WindowSpec {
+    int start;
+    int len;
+};
+
+struct WindowHit {
+    int score;
+    int start;
+    int len;
+    int end_col;  // column inside the coarse window
+};
+
+// ============================================================
+// Device helpers
+// ============================================================
 
 __device__ __forceinline__ int sw_max4(int a, int b, int c, int d) {
     return max(max(a, b), max(c, d));
 }
 
-__device__ __forceinline__ int diag_len(int k, int q_len, int d_len) {
+__device__ __forceinline__ int diag_len_dev(int k, int q_len, int d_len) {
     return min(min(k, q_len), min(d_len, q_len + d_len - k));
 }
 
-__device__ __forceinline__ int diag_start_row(int k, int d_len) {
+__device__ __forceinline__ int diag_start_row_dev(int k, int d_len) {
     return (k <= d_len) ? 1 : (k - d_len + 1);
 }
 
+// ============================================================
+// Host helpers
+// ============================================================
 
+static std::vector<WindowSpec> build_overlapping_windows(
+    int target_len,
+    int window_len,
+    int stride)
+{
+    std::vector<WindowSpec> out;
+    if (target_len <= 0) return out;
 
-// 2. Host function
-void run_cuda_smith_waterman_single(const std::string& q, const std::string& d, 
-                             int& out_score, int& out_start, int& out_stop, 
-                             std::string& out_aligned_q, std::string& out_aligned_d,
-                             float& out_time_ms) {
-    int q_len = q.length();
-    int d_len = d.length();
-    int rows = q_len + 1;
-    int cols = d_len + 1;
-    size_t matrix_bytes = rows * cols * sizeof(int);
-
-    char *d_q, *d_d;
-    int *d_matrix;
-    unsigned long long *d_max_info;
-
-    cudaMalloc(&d_q, q_len * sizeof(char));
-    cudaMalloc(&d_d, d_len * sizeof(char));
-    cudaMalloc(&d_matrix, matrix_bytes);
-    cudaMalloc(&d_max_info, sizeof(unsigned long long));
-
-    cudaMemcpy(d_q, q.c_str(), q_len * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_d, d.c_str(), d_len * sizeof(char), cudaMemcpyHostToDevice);
-    cudaMemset(d_matrix, 0, matrix_bytes); 
-    cudaMemset(d_max_info, 0, sizeof(unsigned long long)); 
-
-    cudaEvent_t start_event, stop_event;
-    cudaEventCreate(&start_event);
-    cudaEventCreate(&stop_event);
-    cudaEventRecord(start_event);
-
-    int match = 2, mismatch = -1, gap = -1; 
-    
-    // Calculate how many TILE blocks we need
-    int num_tiles_q = (q_len + TILE_SIZE - 1) / TILE_SIZE;
-    int num_tiles_d = (d_len + TILE_SIZE - 1) / TILE_SIZE;
-    int total_macro_diagonals = num_tiles_q + num_tiles_d - 1;
-    
-    // Launch Kernel for each MACRO-Diagonal
-    for (int mk = 1; mk <= total_macro_diagonals; ++mk) {
-        int tiles_in_diag = std::min(std::min(mk, num_tiles_q), std::min(num_tiles_d, num_tiles_q + num_tiles_d - mk));
-        
-        // 1 Block = 1 Tile. Threads per Block = TILE_SIZE (32)
-        sw_tiled_macro_wavefront_kernel<<<tiles_in_diag, TILE_SIZE>>>(
-            d_q, d_d, d_matrix, d_max_info, q_len, d_len, match, mismatch, gap, mk
-        );
+    for (int start = 0;; start += stride) {
+        int len = std::min(window_len, target_len - start);
+        out.push_back({start, len});
+        if (start + len >= target_len) break;
     }
 
-    cudaEventRecord(stop_event);
-    cudaEventSynchronize(stop_event); 
-    
-    cudaEventElapsedTime(&out_time_ms, start_event, stop_event);
-    cudaEventDestroy(start_event);
-    cudaEventDestroy(stop_event);
+    int tail_start = std::max(0, target_len - window_len);
+    if (out.empty() || out.back().start != tail_start) {
+        out.push_back({tail_start, target_len - tail_start});
+    }
 
-    int* h_matrix;
-    cudaHostAlloc(&h_matrix, matrix_bytes, cudaHostAllocDefault);
-    cudaMemcpy(h_matrix, d_matrix, matrix_bytes, cudaMemcpyDeviceToHost);
+    std::sort(out.begin(), out.end(), [](const WindowSpec& a, const WindowSpec& b) {
+        return a.start < b.start;
+    });
 
-    unsigned long long h_max_info = 0;
-    cudaMemcpy(&h_max_info, d_max_info, sizeof(unsigned long long), cudaMemcpyDeviceToHost);
+    out.erase(std::unique(out.begin(), out.end(),
+                          [](const WindowSpec& a, const WindowSpec& b) {
+                              return a.start == b.start;
+                          }),
+              out.end());
 
-    int max_score = (h_max_info >> 42) & 0x3FFFFF;      
-    int max_row   = (h_max_info >> 21) & 0x1FFFFF;      
-    int max_col   = h_max_info & 0x1FFFFF;              
+    return out;
+}
 
-    cudaFree(d_q);
-    cudaFree(d_d);
-    cudaFree(d_matrix);
-    cudaFree(d_max_info);
-    
+static std::vector<std::pair<int, int>> merge_intervals(
+    std::vector<std::pair<int, int>> intervals)
+{
+    if (intervals.empty()) return {};
+
+    std::sort(intervals.begin(), intervals.end());
+
+    std::vector<std::pair<int, int>> merged;
+    merged.push_back(intervals[0]);
+
+    for (size_t i = 1; i < intervals.size(); ++i) {
+        if (intervals[i].first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, intervals[i].second);
+        } else {
+            merged.push_back(intervals[i]);
+        }
+    }
+
+    return merged;
+}
+
+// ============================================================
+// Exact single-window kernel (your original style, renamed path)
+// This is used during refinement for exact traceback.
+// ============================================================
+
+__global__ void sw_wavefront_kernel_exact(
+    const char* d_q,
+    const char* d_d,
+    int* d_matrix,
+    int q_len,
+    int d_len,
+    int match_score,
+    int mismatch_score,
+    int gap_score,
+    int k)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int elements_in_diag =
+        min(min(k, q_len), min(d_len, q_len + d_len - k));
+
+    if (tid < elements_in_diag) {
+        int start_row = (k <= d_len) ? 1 : (k - d_len + 1);
+        int row = start_row + tid;
+        int col = k - row + 1;
+        int width = d_len + 1;
+
+        char q_char = d_q[row - 1];
+        char d_char = d_d[col - 1];
+
+        int diag_score = d_matrix[(row - 1) * width + (col - 1)];
+        if (q_char == d_char || q_char == 'N' || d_char == 'N') {
+            diag_score += match_score;
+        } else {
+            diag_score += mismatch_score;
+        }
+
+        int up_score = d_matrix[(row - 1) * width + col] + gap_score;
+        int left_score = d_matrix[row * width + (col - 1)] + gap_score;
+
+        int max_val = max(0, max(diag_score, max(up_score, left_score)));
+        d_matrix[row * width + col] = max_val;
+    }
+}
+
+// ============================================================
+// Exact single-window Smith-Waterman with traceback
+// Keeps your original behavior, but renamed so the batched path
+// can call it for final refinement.
+// ============================================================
+
+void run_cuda_smith_waterman_single(
+    const std::string& q,
+    const std::string& d,
+    int& out_score,
+    int& out_start,
+    int& out_stop,
+    std::string& out_aligned_q,
+    std::string& out_aligned_d,
+    float& out_time_ms)
+{
+    const int q_len = static_cast<int>(q.length());
+    const int d_len = static_cast<int>(d.length());
+
+    if (q_len == 0 || d_len == 0) {
+        out_score = 0;
+        out_start = 0;
+        out_stop = -1;
+        out_aligned_q.clear();
+        out_aligned_d.clear();
+        out_time_ms = 0.0f;
+        return;
+    }
+
+    const int rows = q_len + 1;
+    const int cols = d_len + 1;
+    const size_t matrix_bytes =
+        static_cast<size_t>(rows) * cols * sizeof(int);
+
+    char* d_q = nullptr;
+    char* d_d = nullptr;
+    int* d_matrix = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&d_q, q_len * sizeof(char)));
+    CUDA_CHECK(cudaMalloc(&d_d, d_len * sizeof(char)));
+    CUDA_CHECK(cudaMalloc(&d_matrix, matrix_bytes));
+
+    CUDA_CHECK(cudaMemcpy(d_q, q.data(), q_len * sizeof(char),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_d, d.data(), d_len * sizeof(char),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_matrix, 0, matrix_bytes));
+
+    cudaEvent_t start_event, stop_event;
+    CUDA_CHECK(cudaEventCreate(&start_event));
+    CUDA_CHECK(cudaEventCreate(&stop_event));
+    CUDA_CHECK(cudaEventRecord(start_event));
+
+    const int match = 2;
+    const int mismatch = -1;
+    const int gap = -1;
+    const int total_diagonals = q_len + d_len - 1;
+
+    for (int k = 1; k <= total_diagonals; ++k) {
+        int elements =
+            std::min(std::min(k, q_len),
+                     std::min(d_len, q_len + d_len - k));
+        int threadsPerBlock = 256;
+        int blocksPerGrid = (elements + threadsPerBlock - 1) / threadsPerBlock;
+
+        sw_wavefront_kernel_exact<<<blocksPerGrid, threadsPerBlock>>>(
+            d_q, d_d, d_matrix, q_len, d_len, match, mismatch, gap, k);
+    }
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop_event));
+    CUDA_CHECK(cudaEventSynchronize(stop_event));
+    CUDA_CHECK(cudaEventElapsedTime(&out_time_ms, start_event, stop_event));
+
+    CUDA_CHECK(cudaEventDestroy(start_event));
+    CUDA_CHECK(cudaEventDestroy(stop_event));
+
+    std::vector<int> h_matrix(static_cast<size_t>(rows) * cols);
+    CUDA_CHECK(cudaMemcpy(h_matrix.data(), d_matrix, matrix_bytes,
+                          cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_d));
+    CUDA_CHECK(cudaFree(d_matrix));
+
+    int max_score = 0;
+    int max_row = 0;
+    int max_col = 0;
+
+    for (int r = 1; r <= q_len; ++r) {
+        for (int c = 1; c <= d_len; ++c) {
+            if (h_matrix[r * cols + c] > max_score) {
+                max_score = h_matrix[r * cols + c];
+                max_row = r;
+                max_col = c;
+            }
+        }
+    }
+
     out_score = max_score;
-    out_stop = max_col - 1; 
-
-    std::string aligned_q = "";
-    std::string aligned_d = "";
-    int r = max_row;
-    int c = max_col;
 
     if (max_score == 0) {
         out_start = 0;
-        out_stop = 0;
-        cudaFreeHost(h_matrix);
+        out_stop = -1;
+        out_aligned_q.clear();
+        out_aligned_d.clear();
         return;
     }
+
+    out_stop = max_col - 1;
+
+    std::string aligned_q;
+    std::string aligned_d;
+
+    int r = max_row;
+    int c = max_col;
 
     while (r > 0 && c > 0 && h_matrix[r * cols + c] > 0) {
         int current_score = h_matrix[r * cols + c];
@@ -116,57 +285,48 @@ void run_cuda_smith_waterman_single(const std::string& q, const std::string& d,
 
         char q_char = q[r - 1];
         char d_char = d[c - 1];
-        
-        int match_val = (q_char == d_char || q_char == 'N' || d_char == 'N') ? match : mismatch;
+
+        int match_val =
+            (q_char == d_char || q_char == 'N' || d_char == 'N')
+                ? match
+                : mismatch;
 
         if (current_score == diag_score + match_val) {
-            aligned_q = q_char + aligned_q;
-            aligned_d = d_char + aligned_d;
-            r--; c--;
+            aligned_q.push_back(q_char);
+            aligned_d.push_back(d_char);
+            --r;
+            --c;
         } else if (current_score == left_score + gap) {
-            aligned_q = "-" + aligned_q;
-            aligned_d = d_char + aligned_d;
-            c--;
+            aligned_q.push_back('-');
+            aligned_d.push_back(d_char);
+            --c;
         } else if (current_score == up_score + gap) {
-            aligned_q = q_char + aligned_q;
-            aligned_d = "-" + aligned_d;
-            r--;
+            aligned_q.push_back(q_char);
+            aligned_d.push_back('-');
+            --r;
         } else {
-            break; 
+            break;
         }
     }
 
-    out_start = c; 
+    std::reverse(aligned_q.begin(), aligned_q.end());
+    std::reverse(aligned_d.begin(), aligned_d.end());
+
+    out_start = c;
     out_aligned_q = aligned_q;
     out_aligned_d = aligned_d;
-
-    cudaFreeHost(h_matrix);
 }
 
-/*
-One block = one target window.
-Score-only Smith-Waterman with linear gap.
-Rolling diagonals are stored per-window in global memory slices.
+// ============================================================
+// Batched coarse score-only kernel
+// One block = one window
+// Uses rolling diagonals only
+// ============================================================
 
-Inputs:
-  d_q           : query chars
-  d_windows     : flattened windows, each stored in a fixed-width slot of size window_stride
-  d_win_lens    : actual length of each window
-  q_len         : query length
-  window_stride : fixed storage stride for each window in d_windows
-  batch_size    : number of windows in this launch
-
-Per-window rolling buffers:
-  d_prev2, d_prev1, d_curr each have size batch_size * (q_len + 1)
-
-Outputs:
-  d_best_scores[wid]
-  d_best_endcols[wid]
-*/
 __global__ void sw_batch_score_kernel(
     const char* __restrict__ d_q,
     const char* __restrict__ d_windows,
-    const int*  __restrict__ d_win_lens,
+    const int* __restrict__ d_win_lens,
     int q_len,
     int window_stride,
     int batch_size,
@@ -196,8 +356,8 @@ __global__ void sw_batch_score_kernel(
     int local_best_endcol = 0;
 
     for (int k = 1; k <= q_len + d_len - 1; ++k) {
-        int start_row = diag_start_row(k, d_len);
-        int elems = diag_len(k, q_len, d_len);
+        int start_row = diag_start_row_dev(k, d_len);
+        int elems = diag_len_dev(k, q_len, d_len);
 
         for (int idx = tid; idx < elems; idx += blockDim.x) {
             int row = start_row + idx;
@@ -207,12 +367,12 @@ __global__ void sw_batch_score_kernel(
             char d_char = win[col - 1];
 
             int sub = (q_char == d_char || q_char == 'N' || d_char == 'N')
-                        ? match_score
-                        : mismatch_score;
+                          ? match_score
+                          : mismatch_score;
 
-            int up   = (row > 1)            ? prev1[row - 1] : 0;
-            int left = (col > 1)            ? prev1[row]     : 0;
-            int diag = (row > 1 && col > 1) ? prev2[row - 1] : 0;
+            int up   = (row > 1)             ? prev1[row - 1] : 0;
+            int left = (col > 1)             ? prev1[row]     : 0;
+            int diag = (row > 1 && col > 1)  ? prev2[row - 1] : 0;
 
             int score = sw_max4(0, diag + sub, up + gap_score, left + gap_score);
             curr[row] = score;
@@ -234,7 +394,7 @@ __global__ void sw_batch_score_kernel(
     }
 
     extern __shared__ int s_reduce[];
-    int* s_scores = s_reduce;
+    int* s_scores  = s_reduce;
     int* s_endcols = s_reduce + blockDim.x;
 
     s_scores[tid] = local_best_score;
@@ -257,90 +417,15 @@ __global__ void sw_batch_score_kernel(
     }
 }
 
-#define CUDA_CHECK(call)                                                         \
-    do {                                                                         \
-        cudaError_t err__ = (call);                                              \
-        if (err__ != cudaSuccess) {                                              \
-            std::cerr << "CUDA error: " << cudaGetErrorString(err__)             \
-                      << " at " << __FILE__ << ":" << __LINE__ << "\n";          \
-            std::exit(1);                                                        \
-        }                                                                        \
-    } while (0)
-
-struct SWBatchConfig {
-    int window_len = 0;      // 0 => auto
-    int stride = 0;          // 0 => auto
-    int top_k = 8;           // refine top-K windows
-    int batch_windows = 1024;
-    int threads_per_block = 256;
-    int refine_extra = 0;    // extra halo beyond overlap
-};
-
-struct WindowSpec {
-    int start;
-    int len;
-};
-
-struct WindowHit {
-    int score;
-    int start;
-    int len;
-    int end_col; // inside this window
-};
-
-static std::vector<WindowSpec> build_overlapping_windows(
-    int target_len,
-    int window_len,
-    int stride)
-{
-    std::vector<WindowSpec> out;
-    if (target_len <= 0) return out;
-
-    for (int start = 0; ; start += stride) {
-        int len = std::min(window_len, target_len - start);
-        out.push_back({start, len});
-        if (start + len >= target_len) break;
-    }
-
-    int tail_start = std::max(0, target_len - window_len);
-    if (out.empty() || out.back().start != tail_start) {
-        out.push_back({tail_start, target_len - tail_start});
-    }
-
-    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
-        return a.start < b.start;
-    });
-
-    out.erase(std::unique(out.begin(), out.end(), [](const auto& a, const auto& b) {
-        return a.start == b.start;
-    }), out.end());
-
-    return out;
-}
-
-static std::vector<std::pair<int,int>> merge_intervals(
-    std::vector<std::pair<int,int>> intervals)
-{
-    if (intervals.empty()) return {};
-
-    std::sort(intervals.begin(), intervals.end());
-    std::vector<std::pair<int,int>> merged;
-    merged.push_back(intervals[0]);
-
-    for (size_t i = 1; i < intervals.size(); ++i) {
-        if (intervals[i].first <= merged.back().second) {
-            merged.back().second = std::max(merged.back().second, intervals[i].second);
-        } else {
-            merged.push_back(intervals[i]);
-        }
-    }
-    return merged;
-}
-
+// ============================================================
+// Batched multi-window runner
+// Stage 1: coarse GPU score-only scan over many windows
+// Stage 2: exact refinement on top-K expanded merged regions
+// ============================================================
 
 void run_cuda_smith_waterman_batched(
     const std::string& q,
-    const std::string& d,
+    const std::string& target,
     int& out_score,
     int& out_start,
     int& out_stop,
@@ -350,35 +435,33 @@ void run_cuda_smith_waterman_batched(
     SWBatchConfig cfg = {})
 {
     const int q_len = static_cast<int>(q.size());
-    const int d_len = static_cast<int>(d.size());
+    const int d_len = static_cast<int>(target.size());
+
+    out_score = 0;
+    out_start = 0;
+    out_stop = -1;
+    out_aligned_q.clear();
+    out_aligned_d.clear();
+    out_time_ms = 0.0f;
 
     if (q_len == 0 || d_len == 0) {
-        out_score = 0;
-        out_start = 0;
-        out_stop = -1;
-        out_aligned_q.clear();
-        out_aligned_d.clear();
-        out_time_ms = 0.0f;
         return;
     }
 
-    // Accuracy-oriented defaults:
-    // large overlap, decent batching
+    // Accuracy-oriented defaults
     if (cfg.window_len == 0) cfg.window_len = std::max(8 * q_len, 1024);
     if (cfg.stride == 0)     cfg.stride     = std::max(2 * q_len, 256);
-    if (cfg.stride >= cfg.window_len) cfg.stride = std::max(1, cfg.window_len / 4);
+    if (cfg.stride >= cfg.window_len) {
+        cfg.stride = std::max(1, cfg.window_len / 4);
+    }
 
     const int overlap = cfg.window_len - cfg.stride;
     const int halo = overlap + cfg.refine_extra;
 
-    std::vector<WindowSpec> windows = build_overlapping_windows(d_len, cfg.window_len, cfg.stride);
+    std::vector<WindowSpec> windows =
+        build_overlapping_windows(d_len, cfg.window_len, cfg.stride);
+
     if (windows.empty()) {
-        out_score = 0;
-        out_start = 0;
-        out_stop = -1;
-        out_aligned_q.clear();
-        out_aligned_d.clear();
-        out_time_ms = 0.0f;
         return;
     }
 
@@ -387,7 +470,7 @@ void run_cuda_smith_waterman_batched(
     int* d_win_lens = nullptr;
     int* d_prev2 = nullptr;
     int* d_prev1 = nullptr;
-    int* d_curr  = nullptr;
+    int* d_curr = nullptr;
     int* d_best_scores = nullptr;
     int* d_best_endcols = nullptr;
 
@@ -395,14 +478,19 @@ void run_cuda_smith_waterman_batched(
     const int max_batch = cfg.batch_windows;
 
     CUDA_CHECK(cudaMalloc(&d_q, q_len * sizeof(char)));
-    CUDA_CHECK(cudaMemcpy(d_q, q.data(), q_len * sizeof(char), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_q, q.data(), q_len * sizeof(char),
+                          cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMalloc(&d_windows, static_cast<size_t>(max_batch) * cfg.window_len * sizeof(char)));
+    CUDA_CHECK(cudaMalloc(&d_windows,
+                          static_cast<size_t>(max_batch) * cfg.window_len * sizeof(char)));
     CUDA_CHECK(cudaMalloc(&d_win_lens, max_batch * sizeof(int)));
 
-    CUDA_CHECK(cudaMalloc(&d_prev2, static_cast<size_t>(max_batch) * rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_prev1, static_cast<size_t>(max_batch) * rows * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_curr,  static_cast<size_t>(max_batch) * rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_prev2,
+                          static_cast<size_t>(max_batch) * rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_prev1,
+                          static_cast<size_t>(max_batch) * rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_curr,
+                          static_cast<size_t>(max_batch) * rows * sizeof(int)));
 
     CUDA_CHECK(cudaMalloc(&d_best_scores, max_batch * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_best_endcols, max_batch * sizeof(int)));
@@ -410,13 +498,16 @@ void run_cuda_smith_waterman_batched(
     std::vector<WindowHit> all_hits;
     all_hits.reserve(windows.size());
 
+    float coarse_ms = 0.0f;
+
     cudaEvent_t start_event, stop_event;
     CUDA_CHECK(cudaEventCreate(&start_event));
     CUDA_CHECK(cudaEventCreate(&stop_event));
     CUDA_CHECK(cudaEventRecord(start_event));
 
     for (size_t base = 0; base < windows.size(); base += max_batch) {
-        int chunk = static_cast<int>(std::min<size_t>(max_batch, windows.size() - base));
+        int chunk = static_cast<int>(
+            std::min<size_t>(max_batch, windows.size() - base));
 
         std::vector<char> h_windows(static_cast<size_t>(chunk) * cfg.window_len, 'X');
         std::vector<int> h_win_lens(chunk, 0);
@@ -424,11 +515,9 @@ void run_cuda_smith_waterman_batched(
         for (int i = 0; i < chunk; ++i) {
             const auto& w = windows[base + i];
             h_win_lens[i] = w.len;
-            std::memcpy(
-                h_windows.data() + static_cast<size_t>(i) * cfg.window_len,
-                d.data() + w.start,
-                w.len * sizeof(char)
-            );
+            std::memcpy(h_windows.data() + static_cast<size_t>(i) * cfg.window_len,
+                        target.data() + w.start,
+                        static_cast<size_t>(w.len) * sizeof(char));
         }
 
         CUDA_CHECK(cudaMemcpy(
@@ -443,13 +532,19 @@ void run_cuda_smith_waterman_batched(
             chunk * sizeof(int),
             cudaMemcpyHostToDevice));
 
-        CUDA_CHECK(cudaMemset(d_prev2, 0, static_cast<size_t>(chunk) * rows * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_prev1, 0, static_cast<size_t>(chunk) * rows * sizeof(int)));
-        CUDA_CHECK(cudaMemset(d_curr,  0, static_cast<size_t>(chunk) * rows * sizeof(int)));
+        CUDA_CHECK(cudaMemset(
+            d_prev2, 0,
+            static_cast<size_t>(chunk) * rows * sizeof(int)));
+        CUDA_CHECK(cudaMemset(
+            d_prev1, 0,
+            static_cast<size_t>(chunk) * rows * sizeof(int)));
+        CUDA_CHECK(cudaMemset(
+            d_curr, 0,
+            static_cast<size_t>(chunk) * rows * sizeof(int)));
         CUDA_CHECK(cudaMemset(d_best_scores, 0, chunk * sizeof(int)));
         CUDA_CHECK(cudaMemset(d_best_endcols, 0, chunk * sizeof(int)));
 
-        size_t shmem = 2 * cfg.threads_per_block * sizeof(int);
+        size_t shmem = static_cast<size_t>(2 * cfg.threads_per_block) * sizeof(int);
 
         sw_batch_score_kernel<<<chunk, cfg.threads_per_block, shmem>>>(
             d_q,
@@ -472,23 +567,20 @@ void run_cuda_smith_waterman_batched(
         std::vector<int> h_scores(chunk);
         std::vector<int> h_endcols(chunk);
 
-        CUDA_CHECK(cudaMemcpy(h_scores.data(), d_best_scores, chunk * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_endcols.data(), d_best_endcols, chunk * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_scores.data(), d_best_scores,
+                              chunk * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_endcols.data(), d_best_endcols,
+                              chunk * sizeof(int), cudaMemcpyDeviceToHost));
 
         for (int i = 0; i < chunk; ++i) {
             const auto& w = windows[base + i];
-            all_hits.push_back({
-                h_scores[i],
-                w.start,
-                w.len,
-                h_endcols[i]
-            });
+            all_hits.push_back({h_scores[i], w.start, w.len, h_endcols[i]});
         }
     }
 
     CUDA_CHECK(cudaEventRecord(stop_event));
     CUDA_CHECK(cudaEventSynchronize(stop_event));
-    CUDA_CHECK(cudaEventElapsedTime(&out_time_ms, start_event, stop_event));
+    CUDA_CHECK(cudaEventElapsedTime(&coarse_ms, start_event, stop_event));
 
     CUDA_CHECK(cudaEventDestroy(start_event));
     CUDA_CHECK(cudaEventDestroy(stop_event));
@@ -502,22 +594,23 @@ void run_cuda_smith_waterman_batched(
     CUDA_CHECK(cudaFree(d_best_scores));
     CUDA_CHECK(cudaFree(d_best_endcols));
 
-    std::sort(all_hits.begin(), all_hits.end(), [](const WindowHit& a, const WindowHit& b) {
-        return a.score > b.score;
-    });
-
-    if (all_hits.empty() || all_hits[0].score == 0) {
-        out_score = 0;
-        out_start = 0;
-        out_stop = -1;
-        out_aligned_q.clear();
-        out_aligned_d.clear();
+    if (all_hits.empty()) {
+        out_time_ms = coarse_ms;
         return;
     }
 
-    // Refine top-K windows exactly
+    std::sort(all_hits.begin(), all_hits.end(),
+              [](const WindowHit& a, const WindowHit& b) {
+                  return a.score > b.score;
+              });
+
+    if (all_hits[0].score == 0) {
+        out_time_ms = coarse_ms;
+        return;
+    }
+
     int use_k = std::min<int>(cfg.top_k, static_cast<int>(all_hits.size()));
-    std::vector<std::pair<int,int>> intervals;
+    std::vector<std::pair<int, int>> intervals;
     intervals.reserve(use_k);
 
     for (int i = 0; i < use_k; ++i) {
@@ -528,33 +621,70 @@ void run_cuda_smith_waterman_batched(
 
     intervals = merge_intervals(intervals);
 
-    out_score = 0;
-    out_start = 0;
-    out_stop = -1;
-    out_aligned_q.clear();
-    out_aligned_d.clear();
+    float refine_ms = 0.0f;
 
     for (const auto& iv : intervals) {
-        std::string sub = d.substr(iv.first, iv.second - iv.first);
+        std::string sub = target.substr(iv.first, iv.second - iv.first);
 
-        int score = 0, start = 0, stop = -1;
+        int score = 0;
+        int start = 0;
+        int stop = -1;
         std::string aq, ad;
-        float single_time = 0.0f;
+        float single_time_ms = 0.0f;
 
         run_cuda_smith_waterman_single(
-            q, sub,
-            score, start, stop,
-            aq, ad,
-            single_time
+            q,
+            sub,
+            score,
+            start,
+            stop,
+            aq,
+            ad,
+            single_time_ms
         );
+
+        refine_ms += single_time_ms;
 
         if (score > out_score) {
             out_score = score;
             out_start = start + iv.first;
-            out_stop  = stop  + iv.first;
+            out_stop = stop + iv.first;
             out_aligned_q = std::move(aq);
             out_aligned_d = std::move(ad);
         }
     }
+
+    out_time_ms = coarse_ms + refine_ms;
 }
 
+
+void run_cuda_smith_waterman(
+    const std::string& q,
+    const std::string& d,
+    int& out_score,
+    int& out_start,
+    int& out_stop,
+    std::string& out_aligned_q,
+    std::string& out_aligned_d,
+    float& out_time_ms)
+{
+    SWBatchConfig cfg;
+    cfg.window_len = std::max(8 * static_cast<int>(q.size()), 1024);
+    cfg.stride = std::max(2 * static_cast<int>(q.size()), 256);
+    cfg.top_k = 8;
+    cfg.batch_windows = 1024;
+    cfg.threads_per_block = 256;
+    cfg.refine_extra = 2 * static_cast<int>(q.size());
+
+    run_cuda_smith_waterman_batched(
+        q,
+        d,
+        out_score,
+        out_start,
+        out_stop,
+        out_aligned_q,
+        out_aligned_d,
+        out_time_ms,
+        cfg
+    );
+}
