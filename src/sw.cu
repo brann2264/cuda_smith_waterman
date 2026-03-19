@@ -17,13 +17,11 @@
         }                                                                        \
     } while (0)
 
-// ============================================================
-// Config / helper structs
-// ============================================================
 
+// structs
 struct SWBatchConfig {
-    int window_len = 0;        // 0 => auto
-    int stride = 0;            // 0 => auto
+    int window_len = 0;
+    int stride = 0;
     int batch_windows = 1024;  // windows per GPU launch batch
     int threads_per_block = 256;
     int refine_extra = 0;      // extra halo around the best coarse window
@@ -41,10 +39,7 @@ struct WindowHit {
     int end_col;  // end column inside the coarse window
 };
 
-// ============================================================
-// Device helpers
-// ============================================================
-
+// device helpers
 __device__ __forceinline__ int sw_max4(int a, int b, int c, int d) {
     return max(max(a, b), max(c, d));
 }
@@ -57,10 +52,7 @@ __device__ __forceinline__ int diag_start_row_dev(int k, int d_len) {
     return (k <= d_len) ? 1 : (k - d_len + 1);
 }
 
-// ============================================================
-// Host helper
-// ============================================================
-
+// construct windows
 static std::vector<WindowSpec> build_overlapping_windows(
     int target_len,
     int window_len,
@@ -85,19 +77,15 @@ static std::vector<WindowSpec> build_overlapping_windows(
     });
 
     out.erase(std::unique(out.begin(), out.end(),
-                          [](const WindowSpec& a, const WindowSpec& b) {
-                              return a.start == b.start;
-                          }),
-              out.end());
+            [](const WindowSpec& a, const WindowSpec& b) {
+                return a.start == b.start;
+            }),
+        out.end());
 
     return out;
 }
 
-// ============================================================
-// Exact single-window kernel (your original style)
-// Used once during final refinement.
-// ============================================================
-
+// exact single-window kernel (refinement step)
 __global__ void sw_wavefront_kernel_exact(
     const char* d_q,
     const char* d_d,
@@ -136,10 +124,8 @@ __global__ void sw_wavefront_kernel_exact(
     }
 }
 
-// ============================================================
-// Exact single-window Smith-Waterman with traceback
-// ============================================================
 
+// exact single-window Smith-Waterman with traceback
 void run_cuda_smith_waterman_single(
     const std::string& q,
     const std::string& d,
@@ -189,6 +175,7 @@ void run_cuda_smith_waterman_single(
     const int gap = -1;
     const int total_diagonals = q_len + d_len - 1;
 
+    // parallelism is done per antidiagonal (invoke kernel)
     for (int k = 1; k <= total_diagonals; ++k) {
         int elements = std::min(std::min(k, q_len), std::min(d_len, q_len + d_len - k));
         int threadsPerBlock = 256;
@@ -282,11 +269,9 @@ void run_cuda_smith_waterman_single(
     out_aligned_d = aligned_d;
 }
 
-// ============================================================
-// Batched coarse score-only kernel
-// One block = one overlapping window
-// ============================================================
 
+// batched coarse score-only kernel
+// one block = one overlapping window
 __global__ void sw_batch_score_kernel(
     const char* __restrict__ d_q,
     const char* __restrict__ d_windows,
@@ -312,6 +297,7 @@ __global__ void sw_batch_score_kernel(
     const char* win = d_windows + static_cast<size_t>(wid) * window_stride;
     int d_len = d_win_lens[wid];
 
+    // rolling buffer allocation
     int* prev2 = d_prev2 + static_cast<size_t>(wid) * rows;
     int* prev1 = d_prev1 + static_cast<size_t>(wid) * rows;
     int* curr  = d_curr  + static_cast<size_t>(wid) * rows;
@@ -330,12 +316,10 @@ __global__ void sw_batch_score_kernel(
             char q_char = d_q[row - 1];
             char d_char = win[col - 1];
 
-            int sub = (q_char == d_char || q_char == 'N' || d_char == 'N')
-                        ? match_score
-                        : mismatch_score;
+            int sub = (q_char == d_char || q_char == 'N' || d_char == 'N') ? match_score : mismatch_score;
 
-            int up   = (row > 1)            ? prev1[row - 1] : 0;
-            int left = (col > 1)            ? prev1[row]     : 0;
+            int up   = (row > 1) ? prev1[row - 1] : 0;
+            int left = (col > 1) ? prev1[row] : 0;
             int diag = (row > 1 && col > 1) ? prev2[row - 1] : 0;
 
             int score = sw_max4(0, diag + sub, up + gap_score, left + gap_score);
@@ -349,6 +333,7 @@ __global__ void sw_batch_score_kernel(
 
         __syncthreads();
 
+        // roll to the next antidiagonal
         int* tmp = prev2;
         prev2 = prev1;
         prev1 = curr;
@@ -381,12 +366,7 @@ __global__ void sw_batch_score_kernel(
     }
 }
 
-// ============================================================
-// Batched multi-window runner
-// Stage 1: coarse GPU score-only scan over overlapping windows
-// Stage 2: exact refinement ONLY on the single best coarse window
-// ============================================================
-
+// batched multi-window runner
 void run_cuda_smith_waterman_batched(
     const std::string& q,
     const std::string& target,
@@ -412,8 +392,9 @@ void run_cuda_smith_waterman_batched(
         return;
     }
 
+    // config window len + stride
     if (cfg.window_len == 0) cfg.window_len = std::max(8 * q_len, 1024);
-    if (cfg.stride == 0)     cfg.stride     = std::max(2 * q_len, 256);
+    if (cfg.stride == 0) cfg.stride = std::max(2 * q_len, 256);
     if (cfg.stride >= cfg.window_len) {
         cfg.stride = std::max(1, cfg.window_len / 4);
     }
@@ -421,8 +402,7 @@ void run_cuda_smith_waterman_batched(
     const int overlap = cfg.window_len - cfg.stride;
     const int halo = overlap + cfg.refine_extra;
 
-    std::vector<WindowSpec> windows =
-        build_overlapping_windows(target_len, cfg.window_len, cfg.stride);
+    std::vector<WindowSpec> windows = build_overlapping_windows(target_len, cfg.window_len, cfg.stride);
 
     if (windows.empty()) {
         return;
@@ -534,10 +514,8 @@ void run_cuda_smith_waterman_batched(
         std::vector<int> h_scores(chunk);
         std::vector<int> h_endcols(chunk);
 
-        CUDA_CHECK(cudaMemcpy(h_scores.data(), d_best_scores,
-                              chunk * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_endcols.data(), d_best_endcols,
-                              chunk * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_scores.data(), d_best_scores, chunk * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_endcols.data(), d_best_endcols, chunk * sizeof(int), cudaMemcpyDeviceToHost));
 
         for (int i = 0; i < chunk; ++i) {
             if (h_scores[i] > best_hit.score) {
@@ -579,6 +557,7 @@ void run_cuda_smith_waterman_batched(
 
     float refine_ms = 0.0f;
 
+    // refinement step on the best window
     run_cuda_smith_waterman_single(
         q,
         sub,
@@ -595,10 +574,7 @@ void run_cuda_smith_waterman_batched(
     out_time_ms = coarse_ms + refine_ms;
 }
 
-// ============================================================
-// Convenience wrapper with the original name
-// ============================================================
-
+// wrapper
 void run_cuda_smith_waterman(
     const std::string& q,
     const std::string& d,
