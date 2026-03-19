@@ -17,25 +17,20 @@ BIN_DIR = bin
 TARGET = $(BIN_DIR)/sw
 
 # --- File Hunting ---
-# Automatically find all .cpp and .cu files in the src/ directory
 CPP_SRCS = $(wildcard $(SRC_DIR)/*.cpp)
 CU_SRCS = $(wildcard $(SRC_DIR)/*.cu)
 
-# Translate those source files into target .o object files in the obj/ directory
 CPP_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(CPP_SRCS))
 CU_OBJS = $(patsubst $(SRC_DIR)/%.cu, $(OBJ_DIR)/%.o, $(CU_SRCS))
 OBJS = $(CPP_OBJS) $(CU_OBJS)
 
 # --- Libraries ---
-# Tell the C++ linker where to find the CUDA runtime library
 LIBS = -L/usr/local/cuda/lib64 -lcudart
 
 # --- Rules ---
 
-# Default rule: This runs when you just type 'make'
 all: directories $(TARGET)
 
-# Ensure the obj and bin directories exist before compiling
 directories:
 	@mkdir -p $(OBJ_DIR)
 	@mkdir -p $(BIN_DIR)
